@@ -448,6 +448,60 @@ if (isset($_GET['action'])) {
         exit;
     }
 
+    // --- TRACK BY OSE_ID (QR CODE SCAN) ---
+    if ($action === 'track_by_ose') {
+        $ose_id = preg_replace('/\D/', '', $_GET['ose_id'] ?? '');
+        if (!$ose_id) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Se requiere el identificador de orden (ose_id).']);
+            exit;
+        }
+
+        // 1. Check if we already have this ose_id in tracking_history
+        $stmt = $pdo->prepare("SELECT * FROM tracking_history WHERE raw_search_json LIKE :ose LIMIT 1");
+        $stmt->execute([':ose' => '%"ose_id":' . $ose_id . '%']);
+        $cached = $stmt->fetch();
+        if ($cached) {
+            echo json_encode([
+                'success' => true,
+                'from_cache' => true,
+                'orderNumber' => $cached['order_number'],
+                'orderCode' => $cached['order_code']
+            ]);
+            exit;
+        }
+
+        // 2. Query Shalom API /track/by-ose
+        if (!$api_key) {
+            http_response_code(401);
+            echo json_encode(['error' => 'Debes configurar tu SHALOM_API_KEY para resolver códigos QR.']);
+            exit;
+        }
+
+        $res = make_api_request('/track/by-ose?ose_id=' . $ose_id, 'GET', null, $api_key);
+        if ($res['http_code'] === 200 && !empty($res['data']['success'])) {
+            $data = $res['data']['data'] ?? [];
+            $orderNumber = $data['orderNumber'] ?? '';
+            $orderCode = $data['orderCode'] ?? '';
+
+            if ($orderNumber && $orderCode) {
+                echo json_encode([
+                    'success' => true,
+                    'orderNumber' => $orderNumber,
+                    'orderCode' => $orderCode,
+                    'ose_data' => $data
+                ]);
+                exit;
+            }
+        }
+
+        http_response_code($res['http_code'] ?: 404);
+        echo json_encode([
+            'error' => $res['data']['message'] ?? 'No se pudo encontrar la guía asociada a este código QR.'
+        ]);
+        exit;
+    }
+
     // --- TRACKING WITH SQLITE CACHE & FORCED REFRESH ---
     if ($action === 'track') {
         $input = json_decode(file_get_contents('php://input'), true);
@@ -787,7 +841,8 @@ $has_key = !empty(get_env_var('SHALOM_API_KEY'));
 // Load all agencies for Select2 dropdowns
 $agencies_by_dept = [];
 try {
-    $stmt = $pdo->query("SELECT ter_id, nombre, departamento, provincia, direccion FROM agencies ORDER BY departamento ASC, nombre ASC");
+    $db = get_db();
+    $stmt = $db->query("SELECT ter_id, nombre, departamento, provincia, direccion FROM agencies ORDER BY departamento ASC, nombre ASC");
     while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
         $dept = !empty($row['departamento']) ? strtoupper(trim($row['departamento'])) : 'OTRAS SEDES';
         $agencies_by_dept[$dept][] = $row;
@@ -806,6 +861,8 @@ try {
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <link href="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/css/select2.min.css" rel="stylesheet" />
     <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+    <!-- HTML5 QR Code Scanner CDN -->
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -1019,6 +1076,10 @@ try {
                                 <i data-lucide="search" class="w-4 h-4"></i>
                                 <span>Búsqueda de Envíos</span>
                             </div>
+                            <button type="button" onclick="openQrModal()"
+                                class="inline-flex items-center gap-1.5 px-3 py-1 bg-rose-950/80 hover:bg-rose-900 border border-rose-700/60 text-rose-300 hover:text-white rounded-lg text-xs font-semibold transition-all shadow-sm">
+                                <i data-lucide="qr-code" class="w-3.5 h-3.5"></i> Escanear QR
+                            </button>
                         </div>
                         <h2 class="text-xl font-bold text-white mb-2">Rastreo de Guía</h2>
                         <p class="text-slate-400 text-xs leading-relaxed mb-6">
@@ -1051,23 +1112,17 @@ try {
                                 </label>
                             </div>
 
-                            <button type="submit" id="btnTrackSubmit"
-                                class="w-full mt-2 bg-gradient-to-r from-brand-700 to-rose-600 hover:from-brand-600 hover:to-rose-500 text-white font-medium text-sm py-2.5 px-4 rounded-xl shadow-lg shadow-brand-900/30 flex items-center justify-center gap-2 transition-all">
-                                <i data-lucide="search" class="w-4 h-4"></i> Consultar Envío
-                            </button>
-                        </form>
-                    </div>
-
-                    <div class="mt-6 pt-4 border-t border-slate-800">
-                        <span class="text-xs text-slate-400 block mb-2 font-medium">Ejemplo rápido:</span>
-                        <button type="button" onclick="loadTrackExample('66479331', '3KTH')"
-                            class="w-full text-left bg-slate-950 hover:bg-slate-800/80 border border-slate-800 rounded-lg p-2.5 text-xs transition-all flex items-center justify-between group">
-                            <div>
-                                <span class="font-mono text-slate-200">66479331</span> / <span class="font-mono text-rose-400">3KTH</span>
-                                <span class="block text-[10px] text-slate-500">Guía demo oficial</span>
+                            <div class="grid grid-cols-2 gap-2 mt-2">
+                                <button type="submit" id="btnTrackSubmit"
+                                    class="bg-gradient-to-r from-brand-700 to-rose-600 hover:from-brand-600 hover:to-rose-500 text-white font-medium text-xs py-2.5 px-3 rounded-xl shadow-lg shadow-brand-900/30 flex items-center justify-center gap-1.5 transition-all">
+                                    <i data-lucide="search" class="w-4 h-4"></i> Consultar
+                                </button>
+                                <button type="button" onclick="openQrModal()"
+                                    class="bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 hover:text-white font-medium text-xs py-2.5 px-3 rounded-xl flex items-center justify-center gap-1.5 transition-all">
+                                    <i data-lucide="qr-code" class="w-4 h-4 text-rose-400"></i> Escanear QR
+                                </button>
                             </div>
-                            <i data-lucide="arrow-right" class="w-3.5 h-3.5 text-slate-500 group-hover:text-rose-400 transition-colors"></i>
-                        </button>
+                        </form>
                     </div>
                 </div>
 
@@ -1475,6 +1530,71 @@ try {
         </section>
 
     </main>
+
+    <!-- Modal: QR Code Scanner -->
+    <div id="qrModal" class="fixed inset-0 bg-slate-950/85 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div class="flex items-center justify-between">
+                <div class="flex items-center gap-2.5">
+                    <div class="w-8 h-8 rounded-lg bg-rose-600/20 text-rose-400 flex items-center justify-center border border-rose-500/30">
+                        <i data-lucide="qr-code" class="w-4 h-4"></i>
+                    </div>
+                    <div>
+                        <h3 class="font-bold text-white text-base">Lector de Código QR</h3>
+                        <p class="text-[11px] text-slate-400">Ticket y rótulos de Shalom</p>
+                    </div>
+                </div>
+                <button type="button" onclick="closeQrModal()" class="text-slate-400 hover:text-white p-1 rounded-lg">
+                    <i data-lucide="x" class="w-5 h-5"></i>
+                </button>
+            </div>
+
+            <!-- Tab Buttons for Camera / File Upload -->
+            <div class="flex bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+                <button type="button" id="qrTabCamera" onclick="switchQrMode('camera')"
+                    class="flex-1 py-1.5 rounded-lg font-medium text-center transition-all bg-rose-600 text-white">
+                    <i data-lucide="camera" class="w-3.5 h-3.5 inline mr-1"></i> Cámara en Vivo
+                </button>
+                <button type="button" id="qrTabFile" onclick="switchQrMode('file')"
+                    class="flex-1 py-1.5 rounded-lg font-medium text-center transition-all text-slate-400 hover:text-white">
+                    <i data-lucide="upload" class="w-3.5 h-3.5 inline mr-1"></i> Subir Imagen / Foto
+                </button>
+            </div>
+
+            <!-- Camera View Area -->
+            <div id="qrCameraSection" class="space-y-2">
+                <div id="qrReader" class="overflow-hidden rounded-xl border border-slate-700 bg-black min-h-[260px] flex items-center justify-center relative">
+                    <div id="qrCameraPlaceholder" class="text-center p-6 text-slate-500 text-xs">
+                        <i data-lucide="camera" class="w-8 h-8 mx-auto mb-2 text-slate-600"></i>
+                        Iniciando cámara...
+                    </div>
+                </div>
+                <p class="text-[11px] text-center text-slate-400">
+                    Apunta la cámara al código QR impreso en tu ticket o paquete.
+                </p>
+            </div>
+
+            <!-- File Upload Area -->
+            <div id="qrFileSection" class="hidden space-y-3">
+                <div onclick="document.getElementById('qrFileInput').click()"
+                    class="border-2 border-dashed border-slate-700 hover:border-rose-500 rounded-xl p-8 text-center cursor-pointer bg-slate-950/50 hover:bg-slate-950 transition-all group">
+                    <i data-lucide="image" class="w-10 h-10 text-slate-500 group-hover:text-rose-400 mx-auto mb-2 transition-colors"></i>
+                    <span class="block text-xs font-semibold text-slate-200">Haz clic para seleccionar foto o captura del QR</span>
+                    <span class="block text-[11px] text-slate-500 mt-1">Formatos JPG, PNG, WEBP</span>
+                </div>
+                <input type="file" id="qrFileInput" accept="image/*" class="hidden" onchange="handleQrFileSelected(event)">
+                <div id="qrFileStatus" class="hidden text-xs text-center text-slate-300"></div>
+            </div>
+
+            <!-- Hint / Format info -->
+            <div class="p-3 bg-slate-950 border border-slate-800 rounded-xl text-[11px] text-slate-400 flex items-start gap-2">
+                <i data-lucide="sparkles" class="w-4 h-4 text-rose-400 shrink-0 mt-0.5"></i>
+                <div>
+                    <strong>Detección inteligente:</strong> Lee códigos QR Shalom como <code class="text-rose-300 font-mono text-[10px]">107869605/document/1/</code> y resuelve automáticamente el número de orden y código de seguridad.
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- Modal: Settings -->
     <div id="keyModal" class="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
@@ -2315,6 +2435,183 @@ try {
                 }
             });
         });
+
+        
+        // --- QR SCANNER LOGIC ---
+        let html5QrScanner = null;
+        let qrCurrentMode = 'camera';
+
+        function openQrModal() {
+            document.getElementById('qrModal').classList.remove('hidden');
+            switchQrMode('camera');
+            lucide.createIcons();
+        }
+
+        function closeQrModal() {
+            stopQrCamera();
+            document.getElementById('qrModal').classList.add('hidden');
+        }
+
+        function switchQrMode(mode) {
+            qrCurrentMode = mode;
+            const btnCam = document.getElementById('qrTabCamera');
+            const btnFile = document.getElementById('qrTabFile');
+            const secCam = document.getElementById('qrCameraSection');
+            const secFile = document.getElementById('qrFileSection');
+
+            if (mode === 'camera') {
+                btnCam.className = 'flex-1 py-1.5 rounded-lg font-medium text-center transition-all bg-rose-600 text-white';
+                btnFile.className = 'flex-1 py-1.5 rounded-lg font-medium text-center transition-all text-slate-400 hover:text-white';
+                secCam.classList.remove('hidden');
+                secFile.classList.add('hidden');
+                startQrCamera();
+            } else {
+                btnFile.className = 'flex-1 py-1.5 rounded-lg font-medium text-center transition-all bg-rose-600 text-white';
+                btnCam.className = 'flex-1 py-1.5 rounded-lg font-medium text-center transition-all text-slate-400 hover:text-white';
+                secFile.classList.remove('hidden');
+                secCam.classList.add('hidden');
+                stopQrCamera();
+            }
+            lucide.createIcons();
+        }
+
+        function startQrCamera() {
+            const qrBox = document.getElementById('qrReader');
+            if (!qrBox) return;
+
+            if (html5QrScanner) {
+                stopQrCamera();
+            }
+
+            try {
+                html5QrScanner = new Html5Qrcode("qrReader");
+                const config = {
+                    fps: 10,
+                    qrbox: function(viewfinderWidth, viewfinderHeight) {
+                        const edgeSize = Math.floor(Math.min(viewfinderWidth, viewfinderHeight) * 0.75);
+                        return { width: edgeSize, height: edgeSize };
+                    }
+                };
+
+                html5QrScanner.start(
+                    { facingMode: "environment" },
+                    config,
+                    (decodedText) => {
+                        stopQrCamera();
+                        processScannedQr(decodedText);
+                    },
+                    () => {
+                        // ignore frame tick
+                    }
+                ).catch(err => {
+                    console.warn("No se pudo iniciar la cámara:", err);
+                    const placeholder = document.getElementById('qrCameraPlaceholder');
+                    if (placeholder) {
+                        placeholder.innerHTML = `
+                            <i data-lucide="camera-off" class="w-8 h-8 mx-auto mb-2 text-rose-500"></i>
+                            <span class="text-rose-300 font-semibold block mb-1">Cámara no disponible</span>
+                            <span class="text-slate-400 text-[11px] block">Puedes usar la pestaña <strong>Subir Imagen</strong> para leer una foto del ticket.</span>
+                        `;
+                        lucide.createIcons();
+                    }
+                });
+            } catch (e) {
+                console.error("Html5Qrcode error:", e);
+            }
+        }
+
+        function stopQrCamera() {
+            if (html5QrScanner) {
+                try {
+                    html5QrScanner.stop().catch(() => {}).finally(() => {
+                        html5QrScanner = null;
+                    });
+                } catch (e) {
+                    html5QrScanner = null;
+                }
+            }
+        }
+
+        async function handleQrFileSelected(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const statusBox = document.getElementById('qrFileStatus');
+            statusBox.className = 'text-xs text-center text-slate-300 block';
+            statusBox.innerHTML = '<div class="w-4 h-4 border-2 border-rose-500/30 border-t-rose-500 rounded-full animate-spin inline-block mr-1"></div> Analizando imagen...';
+
+            try {
+                const scanner = new Html5Qrcode("qrReader");
+                const decodedText = await scanner.scanFile(file, true);
+                statusBox.classList.add('hidden');
+                processScannedQr(decodedText);
+            } catch (err) {
+                statusBox.className = 'text-xs text-center text-rose-400 block';
+                statusBox.textContent = 'No se detectó un código QR válido en la imagen. Intenta con una foto más clara.';
+                showToast('No se encontró un código QR en la imagen.', 'error');
+            } finally {
+                event.target.value = '';
+            }
+        }
+
+        function processScannedQr(decodedText) {
+            decodedText = (decodedText || '').trim();
+            console.log("QR decodificado:", decodedText);
+
+            // 1. Direct Pattern: "104425275/H733" or "104425275 - H733"
+            const directMatch = decodedText.match(/^(\d{8,12})\s*[\/\-]\s*([a-zA-Z0-9]{4})$/);
+            if (directMatch) {
+                document.getElementById('trackOrderNumber').value = directMatch[1];
+                document.getElementById('trackOrderCode').value = directMatch[2].toUpperCase();
+                closeQrModal();
+                showToast(`QR detectado: Guía #${directMatch[1]}`, 'success');
+                handleTrack(new Event('submit'));
+                return;
+            }
+
+            // 2. Shalom Standard QR: "107869605/document/1/" or "107869605/document" or "107869605"
+            const oseMatch = decodedText.match(/^(\d{7,15})(?:\/document(?:\/\d*)?)?/i);
+            if (oseMatch) {
+                const oseId = oseMatch[1];
+                resolveOseAndTrack(oseId);
+                return;
+            }
+
+            // 3. Fallback: Any 7-15 digit number in string
+            const digitsMatch = decodedText.match(/\b\d{7,15}\b/);
+            if (digitsMatch) {
+                resolveOseAndTrack(digitsMatch[0]);
+                return;
+            }
+
+            showToast('Formato QR no reconocido: ' + decodedText.substring(0, 30), 'error');
+        }
+
+        async function resolveOseAndTrack(oseId) {
+            showToast(`Resolviendo código QR (${oseId})...`, 'info');
+            closeQrModal();
+
+            try {
+                const res = await fetch(`${API_URL}?action=track_by_ose&ose_id=${oseId}`);
+                const data = await res.json();
+
+                if (!res.ok || !data.success) {
+                    showToast(data.error || 'No se pudo resolver el envío con el código QR.', 'error');
+                    return;
+                }
+
+                document.getElementById('trackOrderNumber').value = data.orderNumber;
+                document.getElementById('trackOrderCode').value = data.orderCode;
+                showToast(`QR resuelto: Orden #${data.orderNumber} • ${data.orderCode}`, 'success');
+
+                // Execute track immediately
+                handleTrack(new Event('submit'));
+
+            } catch (err) {
+                console.error("Error al resolver OSE:", err);
+                showToast('Error de conexión al resolver el código QR.', 'error');
+            }
+        }
 
         // Init
         checkStatus();
